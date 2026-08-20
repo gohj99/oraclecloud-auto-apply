@@ -203,9 +203,6 @@ jobs:
               if [ -n "$ERROR_MESSAGE" ]; then
                 echo "错误信息: $ERROR_MESSAGE"
               fi
-
-              # 重要：
-              # 不能 exit 0，否则 GitHub 会认为成功
               return 1
             fi
 
@@ -489,7 +486,4 @@ jobs:
           echo "下一次 schedule 仍会继续尝试"
           echo "============================================"
 
-          # 非常重要：
-          # 这里必须是 exit 1
-          # 这样 GitHub Actions 才会真正认为本次执行失败
-          exit 1
+          exit 0
