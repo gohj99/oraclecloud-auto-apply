@@ -7,11 +7,6 @@ on:
     - cron: '*/15 * * * *'
   workflow_dispatch:
 
-# 避免定时任务延迟后与下一次运行重叠
-concurrency:
-  group: oci-a1-grab
-  cancel-in-progress: false
-
 jobs:
   grab-a1-instance:
     runs-on: ubuntu-latest
