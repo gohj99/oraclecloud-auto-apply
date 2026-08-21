@@ -1,0 +1,489 @@
+name: OCI A1 Instance Auto Grab 4
+
+on:
+  schedule:
+    # 全天每 15 分钟触发一次
+    # 每次触发后，Job 内部最多连续重试 10 次
+    - cron: '*/15 * * * *'
+  workflow_dispatch:
+
+jobs:
+  grab-a1-instance:
+    runs-on: ubuntu-latest
+
+    env:
+      OCI_CLI_VENV: ${{ github.workspace }}/.cache/oci-cli-venv
+      OCI_CLI_USER: ${{ secrets.OCI_CLI_USER }}
+      OCI_CLI_TENANCY: ${{ secrets.OCI_CLI_TENANCY }}
+      OCI_CLI_FINGERPRINT: ${{ secrets.OCI_CLI_FINGERPRINT }}
+      OCI_CLI_KEY_CONTENT: ${{ secrets.OCI_CLI_KEY_CONTENT }}
+      OCI_CLI_REGION: ${{ secrets.OCI_CLI_REGION }}
+
+    steps:
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Cache OCI CLI environment
+        id: oci-cli-cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.OCI_CLI_VENV }}
+          key: oci-cli-venv-${{ runner.os }}-${{ runner.arch }}-py3.11-v1
+
+      - name: Cache pip packages
+        if: steps.oci-cli-cache.outputs.cache-hit != 'true'
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: pip-oci-cli-${{ runner.os }}-${{ runner.arch }}-py3.11
+
+      - name: Install OCI CLI
+        if: steps.oci-cli-cache.outputs.cache-hit != 'true'
+        run: |
+          python -m venv --copies "$OCI_CLI_VENV"
+          "$OCI_CLI_VENV/bin/pip" install --upgrade pip oci-cli
+
+      - name: Add OCI CLI to PATH
+        run: |
+          echo "$OCI_CLI_VENV/bin" >> "$GITHUB_PATH"
+          "$OCI_CLI_VENV/bin/oci" --version
+
+      - name: Configure OCI CLI
+        run: |
+          mkdir -p ~/.oci
+
+          echo "$OCI_CLI_KEY_CONTENT" > ~/.oci/oci_api_key.pem
+          chmod 600 ~/.oci/oci_api_key.pem
+
+          cat > ~/.oci/config <<EOF
+          [DEFAULT]
+          user=${OCI_CLI_USER}
+          fingerprint=${OCI_CLI_FINGERPRINT}
+          tenancy=${OCI_CLI_TENANCY}
+          region=${OCI_CLI_REGION}
+          key_file=~/.oci/oci_api_key.pem
+          EOF
+
+          chmod 600 ~/.oci/config
+
+          echo "=== 验证 OCI CLI 配置 ==="
+          oci iam region list --output table
+
+      - name: Grab or Scale A1 Instance
+        env:
+          OCI_COMPARTMENT_ID: ${{ secrets.OCI_COMPARTMENT_ID }}
+          OCI_SUBNET_ID: ${{ secrets.OCI_SUBNET_ID }}
+          OCI_AVAILABILITY_DOMAIN: ${{ secrets.OCI_AVAILABILITY_DOMAIN }}
+          OCI_IMAGE_ID: ${{ secrets.OCI_IMAGE_ID }}
+          OCI_SSH_PUBLIC_KEY: ${{ secrets.OCI_SSH_PUBLIC_KEY }}
+        run: |
+          # ============================================================
+          # 重试参数
+          # ============================================================
+          MAX_ATTEMPTS=10
+          RETRY_INTERVAL=30
+
+          echo "============================================"
+          echo "OCI A1 Auto Grab"
+          echo "最多尝试: ${MAX_ATTEMPTS} 次"
+          echo "每次间隔: ${RETRY_INTERVAL} 秒"
+          echo "============================================"
+
+          # ============================================================
+          # 单次完整尝试
+          #
+          # 返回 0 = 成功
+          # 返回 1 = 失败，需要下一次重试
+          # ============================================================
+          grab_once() {
+            set +e
+
+            TARGET_OCPUS=2
+            TARGET_MEMORY=12
+
+            # 扩容阶梯
+            SCALE_OCPUS=(1 2)
+            SCALE_MEMORY=(6 12)
+
+            echo
+            echo "============================================"
+            echo "开始单次尝试"
+            echo "============================================"
+
+            INSTANCE_ID=""
+            INSTANCE_STATE=""
+
+            # ========================================================
+            # 第一步：查询所有现有 A1 实例
+            # ========================================================
+            echo "=== 检查现有 A1 实例 ==="
+
+            for STATE_FILTER in RUNNING STOPPED; do
+              RESULT=$(oci compute instance list \
+                --compartment-id "$OCI_COMPARTMENT_ID" \
+                --availability-domain "$OCI_AVAILABILITY_DOMAIN" \
+                --lifecycle-state "$STATE_FILTER" \
+                --query 'data[?"shape"==`VM.Standard.A1.Flex`]' \
+                2>&1)
+
+              OCI_EXIT=$?
+
+              if [ $OCI_EXIT -ne 0 ]; then
+                echo "查询 ${STATE_FILTER} 实例失败:"
+                echo "$RESULT"
+                return 1
+              fi
+
+              ID=$(echo "$RESULT" | jq -r '.[0].id // empty' 2>/dev/null)
+
+              if [ -n "$ID" ]; then
+                INSTANCE_ID="$ID"
+                INSTANCE_STATE="$STATE_FILTER"
+
+                echo "发现 ${STATE_FILTER} 状态的 A1 实例:"
+                echo "$INSTANCE_ID"
+
+                break
+              fi
+            done
+
+            # ========================================================
+            # 第二步：无实例 → 尝试创建 1C / 6G
+            # ========================================================
+            if [ -z "$INSTANCE_ID" ]; then
+              echo
+              echo "=== 无现有 A1 实例，尝试创建 ==="
+              echo "尝试创建 1C / 6G 实例..."
+
+              CREATE_RESULT=$(oci compute instance launch \
+                --compartment-id "$OCI_COMPARTMENT_ID" \
+                --availability-domain "$OCI_AVAILABILITY_DOMAIN" \
+                --shape "VM.Standard.A1.Flex" \
+                --shape-config "{\"ocpus\": 1, \"memoryInGBs\": 6}" \
+                --image-id "$OCI_IMAGE_ID" \
+                --subnet-id "$OCI_SUBNET_ID" \
+                --assign-public-ip true \
+                --metadata "{\"ssh_authorized_keys\": \"$OCI_SSH_PUBLIC_KEY\"}" \
+                --display-name "A1-Auto-Grabbed" \
+                2>&1)
+
+              CREATE_EXIT=$?
+
+              if [ $CREATE_EXIT -eq 0 ]; then
+                CREATED_ID=$(echo "$CREATE_RESULT" | jq -r '.data.id // empty' 2>/dev/null)
+
+                if [ -n "$CREATED_ID" ]; then
+                  echo
+                  echo "============================================"
+                  echo "实例创建成功!"
+                  echo "实例 ID: $CREATED_ID"
+                  echo "当前配置: 1C / 6G"
+                  echo "============================================"
+
+                  echo
+                  echo "等待下一次运行扩容到 2C / 12G"
+
+                  return 0
+                fi
+              fi
+
+              echo
+              echo "创建失败:"
+              echo "$CREATE_RESULT"
+
+              ERROR_CODE=$(echo "$CREATE_RESULT" | jq -r '.code // empty' 2>/dev/null)
+              ERROR_MESSAGE=$(echo "$CREATE_RESULT" | jq -r '.message // empty' 2>/dev/null)
+
+              if [ -n "$ERROR_CODE" ]; then
+                echo "错误代码: $ERROR_CODE"
+              fi
+
+              if [ -n "$ERROR_MESSAGE" ]; then
+                echo "错误信息: $ERROR_MESSAGE"
+              fi
+              return 1
+            fi
+
+            # ========================================================
+            # 第三步：已有实例 → 获取当前配置
+            # ========================================================
+            echo
+            echo "=== 检查实例当前配置 ==="
+
+            CURRENT_CONFIG=$(oci compute instance get \
+              --instance-id "$INSTANCE_ID" \
+              --query 'data."shape-config"' \
+              2>&1)
+
+            GET_CONFIG_EXIT=$?
+
+            if [ $GET_CONFIG_EXIT -ne 0 ]; then
+              echo "获取实例配置失败:"
+              echo "$CURRENT_CONFIG"
+              return 1
+            fi
+
+            CURRENT_OCPUS=$(echo "$CURRENT_CONFIG" | jq -r '.ocpus // 0' 2>/dev/null)
+            CURRENT_MEMORY=$(echo "$CURRENT_CONFIG" | jq -r '."memory-in-gbs" // 0' 2>/dev/null)
+
+            CURRENT_OCPUS=${CURRENT_OCPUS%.*}
+            CURRENT_MEMORY=${CURRENT_MEMORY%.*}
+
+            echo "实例 ID: $INSTANCE_ID"
+            echo "实例状态: $INSTANCE_STATE"
+            echo "当前配置: ${CURRENT_OCPUS}C / ${CURRENT_MEMORY}G"
+            echo "目标配置: ${TARGET_OCPUS}C / ${TARGET_MEMORY}G"
+
+            # ========================================================
+            # 第四步：判断是否已经达到目标
+            #
+            # 注意：
+            # 原来只判断 OCPU，导致 2C / 6G 被错误认为完成
+            # ========================================================
+            if [ "$CURRENT_OCPUS" -ge "$TARGET_OCPUS" ] && \
+               [ "$CURRENT_MEMORY" -ge "$TARGET_MEMORY" ]; then
+
+              echo
+              echo "已达到目标配置，无需扩容。"
+
+              # 如果实例是 STOPPED，则启动
+              if [ "$INSTANCE_STATE" = "STOPPED" ]; then
+                echo "实例处于 STOPPED 状态，启动实例..."
+
+                START_RESULT=$(oci compute instance action \
+                  --instance-id "$INSTANCE_ID" \
+                  --action START \
+                  2>&1)
+
+                START_EXIT=$?
+
+                if [ $START_EXIT -ne 0 ]; then
+                  echo "启动实例失败:"
+                  echo "$START_RESULT"
+                  return 1
+                fi
+
+                echo "实例启动成功。"
+              fi
+
+              return 0
+            fi
+
+            # ========================================================
+            # 第五步：确定下一档配置
+            # ========================================================
+            NEXT_OCPUS=""
+            NEXT_MEMORY=""
+
+            for i in "${!SCALE_OCPUS[@]}"; do
+              if [ "${SCALE_OCPUS[$i]}" -gt "$CURRENT_OCPUS" ] 2>/dev/null; then
+                NEXT_OCPUS="${SCALE_OCPUS[$i]}"
+                NEXT_MEMORY="${SCALE_MEMORY[$i]}"
+                break
+              fi
+            done
+
+            # 如果 OCPU 已到目标，但内存还没到目标
+            if [ -z "$NEXT_OCPUS" ] && \
+               [ "$CURRENT_OCPUS" -ge "$TARGET_OCPUS" ] && \
+               [ "$CURRENT_MEMORY" -lt "$TARGET_MEMORY" ]; then
+              NEXT_OCPUS="$TARGET_OCPUS"
+              NEXT_MEMORY="$TARGET_MEMORY"
+            fi
+
+            if [ -z "$NEXT_OCPUS" ]; then
+              echo "无法确定下一档扩容配置。"
+              return 1
+            fi
+
+            echo
+            echo "=== 尝试扩容 ==="
+            echo "目标: ${NEXT_OCPUS}C / ${NEXT_MEMORY}G"
+
+            # ========================================================
+            # 第六步：如果实例运行中，先停止
+            # ========================================================
+            if [ "$INSTANCE_STATE" = "RUNNING" ]; then
+              echo "实例当前运行中，执行 SOFTSTOP..."
+
+              STOP_RESULT=$(oci compute instance action \
+                --instance-id "$INSTANCE_ID" \
+                --action SOFTSTOP \
+                2>&1)
+
+              STOP_EXIT=$?
+
+              if [ $STOP_EXIT -ne 0 ]; then
+                echo "停止实例失败:"
+                echo "$STOP_RESULT"
+                return 1
+              fi
+
+              echo "SOFTSTOP 已发送。"
+            fi
+
+            # ========================================================
+            # 第七步：等待实例 STOPPED
+            # ========================================================
+            echo "等待实例停止..."
+
+            STOPPED=false
+
+            for i in $(seq 1 10); do
+
+              STATE=$(oci compute instance get \
+                --instance-id "$INSTANCE_ID" \
+                --query 'data."lifecycle-state"' \
+                --raw-output \
+                2>&1)
+
+              GET_STATE_EXIT=$?
+
+              if [ $GET_STATE_EXIT -ne 0 ]; then
+                echo "获取实例状态失败:"
+                echo "$STATE"
+                return 1
+              fi
+
+              echo "实例状态: $STATE"
+
+              if [ "$STATE" = "STOPPED" ]; then
+                STOPPED=true
+                break
+              fi
+
+              sleep 15
+            done
+
+            if [ "$STOPPED" != "true" ]; then
+              echo "等待实例停止超时。"
+
+              # 尝试恢复启动
+              echo "尝试启动实例..."
+              oci compute instance action \
+                --instance-id "$INSTANCE_ID" \
+                --action START \
+                2>&1 || true
+
+              return 1
+            fi
+
+            # ========================================================
+            # 第八步：修改 Shape
+            # ========================================================
+            echo
+            echo "修改实例配置为 ${NEXT_OCPUS}C / ${NEXT_MEMORY}G..."
+
+            UPDATE_RESULT=$(oci compute instance update \
+              --instance-id "$INSTANCE_ID" \
+              --shape-config "{\"ocpus\": ${NEXT_OCPUS}, \"memoryInGBs\": ${NEXT_MEMORY}}" \
+              --force \
+              2>&1)
+
+            UPDATE_EXIT=$?
+
+            UPDATED_ID=$(echo "$UPDATE_RESULT" | jq -r '.data.id // empty' 2>/dev/null)
+
+            if [ $UPDATE_EXIT -eq 0 ] && [ -n "$UPDATED_ID" ]; then
+              echo
+              echo "============================================"
+              echo "扩容成功!"
+              echo "新配置: ${NEXT_OCPUS}C / ${NEXT_MEMORY}G"
+              echo "============================================"
+            else
+              echo
+              echo "扩容失败:"
+              echo "$UPDATE_RESULT"
+
+              ERROR_CODE=$(echo "$UPDATE_RESULT" | jq -r '.code // empty' 2>/dev/null)
+              ERROR_MESSAGE=$(echo "$UPDATE_RESULT" | jq -r '.message // empty' 2>/dev/null)
+
+              if [ -n "$ERROR_CODE" ]; then
+                echo "错误代码: $ERROR_CODE"
+              fi
+
+              if [ -n "$ERROR_MESSAGE" ]; then
+                echo "错误信息: $ERROR_MESSAGE"
+              fi
+
+              # 扩容失败后尝试恢复启动
+              echo "尝试启动实例..."
+              START_RESULT=$(oci compute instance action \
+                --instance-id "$INSTANCE_ID" \
+                --action START \
+                2>&1)
+
+              START_EXIT=$?
+
+              if [ $START_EXIT -ne 0 ]; then
+                echo "启动失败:"
+                echo "$START_RESULT"
+              fi
+
+              return 1
+            fi
+
+            # ========================================================
+            # 第九步：启动实例
+            # ========================================================
+            echo
+            echo "启动实例..."
+
+            START_RESULT=$(oci compute instance action \
+              --instance-id "$INSTANCE_ID" \
+              --action START \
+              2>&1)
+
+            START_EXIT=$?
+
+            if [ $START_EXIT -ne 0 ]; then
+              echo "启动实例失败:"
+              echo "$START_RESULT"
+              return 1
+            fi
+
+            echo "实例启动命令已发送。"
+
+            echo
+            echo "=== 本次尝试完成 ==="
+
+            return 0
+          }
+
+          # ============================================================
+          # 外层自动重试
+          # ============================================================
+          for ATTEMPT in $(seq 1 "$MAX_ATTEMPTS"); do
+
+            echo
+            echo "##################################################"
+            echo "第 ${ATTEMPT}/${MAX_ATTEMPTS} 次尝试"
+            echo "##################################################"
+
+            if grab_once; then
+              echo
+              echo "============================================"
+              echo "成功！无需继续重试。"
+              echo "============================================"
+              exit 0
+            fi
+
+            echo
+            echo "第 ${ATTEMPT} 次尝试失败。"
+
+            if [ "$ATTEMPT" -lt "$MAX_ATTEMPTS" ]; then
+              echo "等待 ${RETRY_INTERVAL} 秒后继续重试..."
+              sleep "$RETRY_INTERVAL"
+            fi
+          done
+
+          echo
+          echo "============================================"
+          echo "所有重试均失败"
+          echo "本次 GitHub Action 标记为失败"
+          echo "下一次 schedule 仍会继续尝试"
+          echo "============================================"
+
+          exit 0
